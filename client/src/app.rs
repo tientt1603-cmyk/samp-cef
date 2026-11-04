@@ -250,6 +250,13 @@ impl App {
             crate::external::call_disconnect();
         }
 
+        // VSL: give the player his own SA-MP chat / GTA HUD back (shows SA-MP's own kick / ban lines);
+        // not while the game is closing after the VSL quit (no flash of the old chat)
+        if !crate::vsl::is_quitting() {
+            crate::vsl::set_locked(false);
+            crate::vsl::set_ui_locked(false);
+        }
+
         let mut manager = self.manager.lock();
         manager.close_all_browsers();
         self.network.take();
@@ -341,6 +348,12 @@ pub fn mainloop() {
             return;
         }
 
+        // VSL: old SA-MP chat / GTA HUD off while the server locks them; live HUD values to the pages
+        if let Some(hud) = crate::vsl::frame() {
+            let manager = app.manager.lock();
+            manager.trigger_event("vsl:hud", hud);
+        }
+
         {
             let menu = CMenuManager::get();
             let paused = menu.is_active() || !app.window_focused;
@@ -426,11 +439,54 @@ pub fn mainloop() {
                 }
 
                 Event::EmitEvent(event, list) => {
+                    match event.as_str() {
+                        "vsl:chatlock" => crate::vsl::set_locked(list.integer(0) == 1),
+                        "vsl:uilock" => crate::vsl::set_ui_locked(list.integer(0) == 1),
+                        "vsl:escpass" => crate::vsl::set_esc_pass(list.integer(0) == 1),
+                        "vsl:gameset" => {
+                            let key = list.string(0).to_string();
+                            crate::vsl::game_set(&key, list.integer(1));
+                        }
+                        "vsl:gameget" => {
+                            let manager = app.manager.lock();
+                            manager.trigger_event("vsl:gamecfg", crate::vsl::game_cfg());
+                        }
+                        "vsl:nativemenu" => crate::vsl::open_native_menu(),
+                        "vsl:quitgame" => crate::vsl::begin_quit(),
+                        _ => (),
+                    }
+
                     let manager = app.manager.lock();
                     manager.trigger_event(&event, list);
                 }
 
                 Event::EmitEventOnServer(event, arguments) => {
+                    // VSL: page heartbeat (watchdog), quit, SA-MP client commands typed in the VSL chat
+                    match event.as_str() {
+                        "vsl:beat" => {
+                            crate::vsl::beat();
+                            continue;
+                        }
+                        "vsl:say" => match crate::vsl::client_say(&arguments) {
+                            crate::vsl::SayAction::Handled => continue,
+                            crate::vsl::SayAction::Quit => {
+                                crate::vsl::begin_quit();
+
+                                if let Some(network) = app.network.as_mut() {
+                                    network.send(Event::EmitEventOnServer(
+                                        "vsl:ui".to_string(),
+                                        "quit".to_string(),
+                                    ));
+                                }
+
+                                continue;
+                            }
+                            crate::vsl::SayAction::Forward => (),
+                        },
+                        "vsl:ui" if arguments.trim() == "quit" => crate::vsl::begin_quit(),
+                        _ => (),
+                    }
+
                     if let Some(network) = app.network.as_mut() {
                         let event = Event::EmitEventOnServer(event, arguments);
                         network.send(event);
@@ -474,6 +530,9 @@ pub fn mainloop() {
                 }
 
                 Event::NetworkJoined => {
+                    // VSL: a CEF server answered -> hide the old SA-MP chat right away (connect lines);
+                    // the server unlocks it again if its page cannot load
+                    crate::vsl::set_locked(true);
                     app.connected = true;
                     app.bad_version_notified = false;
                     app.reset_connect_backoff();
@@ -605,6 +664,30 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
             }
 
             WM_KEYDOWN | WM_KEYUP | WM_CHAR | WM_SYSCHAR | WM_SYSKEYDOWN | WM_SYSKEYUP => {
+                // VSL: on a VSL server T / F6 (chat), ESC (menu), TAB (players), F1 (help) open VSL pages
+                if (crate::vsl::is_locked() || crate::vsl::is_ui_locked())
+                    && !manager.is_input_blocked()
+                    && !inputs::Input::is_active()
+                    && !inputs::Dialog::is_input_focused()
+                    && !CMenuManager::is_menu_active()
+                {
+                    if let Some(key) = crate::vsl::key_for(wparam) {
+                        if msg == WM_KEYDOWN {
+                            manager.trigger_event(crate::vsl::event_name(&key), List::new());
+                            crate::vsl::swallow_next_char();
+                            return true;
+                        }
+
+                        if msg == WM_KEYUP {
+                            return true;
+                        }
+                    }
+
+                    if msg == WM_CHAR && crate::vsl::take_swallowed_char() {
+                        return true;
+                    }
+                }
+
                 let is_system_key = msg == WM_SYSCHAR || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
 
                 let mut event: cef_key_event_t = unsafe { std::mem::zeroed() };

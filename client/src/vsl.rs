@@ -550,28 +550,25 @@ pub fn pos_frame(position: client_api::gta::matrix::CVector, camera: &client_api
     Some(list)
 }
 
-/// The old SA-MP chat input must never be open while the chat is locked (Owner test 2026-11-07: it was
+/// The old SA-MP chat input must never be open while the chat is locked (Owner tests 2026-11-07: it was
 /// already open at the first T after joining, and an open SA-MP input takes every key). Whatever opened it,
-/// it is closed the way SA-MP closes it itself: an Escape key sent to the game window (at most every 300 ms).
+/// it is closed in the same frame: its enabled flag off, then SA-MP's own cursor / controls restore
+/// (an Escape sent to the window did NOT close it on 0.3.DL: it flashed on and off).
 fn close_samp_input(now: u64) {
-    if !client_api::samp::inputs::Input::is_active() {
+    use client_api::samp::inputs::{show_cursor, Input};
+
+    if !Input::is_active() {
         return;
     }
 
-    if now.saturating_sub(LAST_INPUT_CLOSE_MS.load(Ordering::Relaxed)) < 300 {
-        return;
+    if let Some(input) = Input::get() {
+        input.m_bEnabled = 0;
     }
 
-    LAST_INPUT_CLOSE_MS.store(now, Ordering::Relaxed);
+    show_cursor(false);   // SA-MP: no cursor, player controls back (CGame::ProcessInputEnabling)
 
-    if let Some(hwnd) = client_api::wndproc::hwnd() {
-        use winapi::um::winuser::{PostMessageA, VK_ESCAPE, WM_KEYDOWN, WM_KEYUP};
-
-        unsafe {
-            PostMessageA(hwnd, WM_KEYDOWN, VK_ESCAPE as usize, 0x0001_0001);
-            PostMessageA(hwnd, WM_KEYUP, VK_ESCAPE as usize, 0xC001_0001u32 as isize);
-        }
-
+    if now.saturating_sub(LAST_INPUT_CLOSE_MS.load(Ordering::Relaxed)) >= 2000 {
+        LAST_INPUT_CLOSE_MS.store(now, Ordering::Relaxed);
         tracing::info!("VSL: old SA-MP chat input was open while the chat is locked: closed");
     }
 }

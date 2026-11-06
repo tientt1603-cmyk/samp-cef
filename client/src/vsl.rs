@@ -506,14 +506,24 @@ pub fn pos_frame(position: client_api::gta::matrix::CVector, camera: &client_api
 
     LAST_POS_MS.store(now, Ordering::Relaxed);
 
-    // the camera looks along its "at" vector (same convention as the 3D audio listener)
-    let mut heading = camera.at.x.atan2(camera.at.y).to_degrees();
+    // where the camera looks = from the camera to the player (the GTA camera stands behind him): no guess
+    // about matrix axes (Owner test 2026-11-07: the 'at' axis gave a wrong heading). Camera inside the
+    // player (first person, close aim): keep the last heading.
+    let (dx, dy) = (position.x - camera.pos.x, position.y - camera.pos.y);
+    let last_heading = LAST_POS.lock().map(|l| l[2]).unwrap_or(0);
+    let heading = if dx * dx + dy * dy < 0.25 {
+        if last_heading == i32::MIN { 0 } else { last_heading }
+    } else {
+        let mut h = dx.atan2(dy).to_degrees();   // 0 = north (+y), 90 = east (+x): clockwise
 
-    if heading < 0.0 {
-        heading += 360.0;
-    }
+        if h < 0.0 {
+            h += 360.0;
+        }
 
-    let values = [position.x.round() as i32, position.y.round() as i32, heading.round() as i32 % 360];
+        h.round() as i32 % 360
+    };
+
+    let values = [position.x.round() as i32, position.y.round() as i32, heading];
 
     if let Ok(mut last) = LAST_POS.lock() {
         let same = last[0] != i32::MIN

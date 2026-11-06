@@ -185,6 +185,8 @@ impl App {
 
         client_api::wndproc::append_callback(win_event);
 
+        crate::vsl::install_hooks();   // VSL: the old SA-MP chat input never opens under the chat lock
+
         NetGame::on_destroy(|| {
             tracing::debug!("SA:MP session is shutting down");
             uninitialize();

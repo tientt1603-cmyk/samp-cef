@@ -550,6 +550,66 @@ pub fn pos_frame(position: client_api::gta::matrix::CVector, camera: &client_api
     Some(list)
 }
 
+// ------------------------------------------------------------------ SA-MP chat input: never opens while locked
+// Root fix (Owner 2026-11-07, "giải pháp triệt để"): SA-MP's CInput::Open is hooked; under the chat lock it
+// does nothing, whatever calls it (T, F6, SA-MP's own re-open paths). Address found in samp.dll 0.3.DL by
+// the only code that writes m_bEnabled = 1 (offset 0x14E0); the first bytes are checked before hooking, so a
+// different samp.dll is never patched (the state closer below stays as the safety net).
+type InputOpenFn = extern "thiscall" fn(*mut std::ffi::c_void);
+
+static mut INPUT_OPEN_HOOK: Option<retour::GenericDetour<InputOpenFn>> = None;
+
+const DL_INPUT_OPEN: usize = 0x68EC0;
+const DL_INPUT_OPEN_BYTES: [u8; 12] = [0x83, 0xEC, 0x10, 0x56, 0x8B, 0xF1, 0x8B, 0x86, 0xE0, 0x14, 0x00, 0x00];
+
+/// called once from App::initialize_hooks (SA-MP is loaded)
+pub fn install_hooks() {
+    if version() != Version::V03DL {
+        tracing::info!("VSL: no SA-MP input hook for this SA-MP version (state closer only)");
+        return;
+    }
+
+    unsafe {
+        let base = client_api::samp::handle();
+
+        if base.is_null() {
+            return;
+        }
+
+        let addr = base.add(DL_INPUT_OPEN);
+        let head = std::slice::from_raw_parts(addr as *const u8, DL_INPUT_OPEN_BYTES.len());
+
+        if head != DL_INPUT_OPEN_BYTES {
+            tracing::warn!("VSL: samp.dll is not the expected 0.3.DL build: SA-MP input hook skipped");
+            return;
+        }
+
+        let open: InputOpenFn = std::mem::transmute(addr);
+
+        match retour::GenericDetour::new(open, input_open) {
+            Ok(hook) => {
+                if hook.enable().is_ok() {
+                    *std::ptr::addr_of_mut!(INPUT_OPEN_HOOK) = Some(hook);
+                    tracing::info!("VSL: SA-MP input hook installed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "VSL: SA-MP input hook failed"),
+        }
+    }
+}
+
+extern "thiscall" fn input_open(this: *mut std::ffi::c_void) {
+    if is_locked() {
+        return;   // the VSL chat replaces it: never open the old input
+    }
+
+    unsafe {
+        if let Some(hook) = (*std::ptr::addr_of!(INPUT_OPEN_HOOK)).as_ref() {
+            hook.call(this);
+        }
+    }
+}
+
 /// The old SA-MP chat input must never be open while the chat is locked (Owner tests 2026-11-07: it was
 /// already open at the first T after joining, and an open SA-MP input takes every key). Whatever opened it,
 /// it is closed in the same frame: its enabled flag off, then SA-MP's own cursor / controls restore

@@ -39,6 +39,7 @@ static SAVED_HUD: AtomicI32 = AtomicI32::new(-1);
 static LAST_HUD_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_HUD: std::sync::Mutex<[i32; 11]> = std::sync::Mutex::new([i32::MIN; 11]);
 static LAST_POS_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_INPUT_CLOSE_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_POS: std::sync::Mutex<[i32; 3]> = std::sync::Mutex::new([i32::MIN; 3]);
 
 // watchdog + quit
@@ -378,6 +379,8 @@ pub fn frame() -> Option<List> {
     watchdog(now);
 
     if is_locked() {
+        close_samp_input(now);
+
         if let Some(chat) = chat_ptr() {
             unsafe {
                 let mode = chat.add(CHAT_MODE_OFFSET) as *mut i32;
@@ -545,6 +548,32 @@ pub fn pos_frame(position: client_api::gta::matrix::CVector, camera: &client_api
     }
 
     Some(list)
+}
+
+/// The old SA-MP chat input must never be open while the chat is locked (Owner test 2026-11-07: it was
+/// already open at the first T after joining, and an open SA-MP input takes every key). Whatever opened it,
+/// it is closed the way SA-MP closes it itself: an Escape key sent to the game window (at most every 300 ms).
+fn close_samp_input(now: u64) {
+    if !client_api::samp::inputs::Input::is_active() {
+        return;
+    }
+
+    if now.saturating_sub(LAST_INPUT_CLOSE_MS.load(Ordering::Relaxed)) < 300 {
+        return;
+    }
+
+    LAST_INPUT_CLOSE_MS.store(now, Ordering::Relaxed);
+
+    if let Some(hwnd) = client_api::wndproc::hwnd() {
+        use winapi::um::winuser::{PostMessageA, VK_ESCAPE, WM_KEYDOWN, WM_KEYUP};
+
+        unsafe {
+            PostMessageA(hwnd, WM_KEYDOWN, VK_ESCAPE as usize, 0x0001_0001);
+            PostMessageA(hwnd, WM_KEYUP, VK_ESCAPE as usize, 0xC001_0001u32 as isize);
+        }
+
+        tracing::info!("VSL: old SA-MP chat input was open while the chat is locked: closed");
+    }
 }
 
 /// keys that open VSL pages instead of SA-MP / GTA screens

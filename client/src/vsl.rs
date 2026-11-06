@@ -4,7 +4,9 @@
 //! Events from the server (browser events the plugin also reads):
 //!  * "vsl:chatlock" 1/0  - old SA-MP chat window kept off (mode 0); T / F6 -> "vsl:chatkey"
 //!  * "vsl:uilock"   1/0  - GTA HUD + radar off (unless the player turned it back on), ESC -> "vsl:esc",
-//!                          TAB -> "vsl:tab", F1 -> "vsl:f1", live HUD values -> "vsl:hud"
+//!                          TAB -> "vsl:tab", F1 -> "vsl:f1", M -> "vsl:mapkey", live HUD values -> "vsl:hud",
+//!                          own position + camera heading -> "vsl:pos"; the map page of the GTA pause menu
+//!                          is closed (the map is an item on VSL servers: Owner 2026-11-07)
 //!  * "vsl:escpass"  1/0  - a SA-MP textdraw selection is open: ESC must reach SA-MP (cancel)
 //!  * "vsl:gameset"  key value - "hud" 0/1 (show the GTA HUD), "fps" 0/1 (frame limiter)
 //!  * "vsl:gameget"        - answer "vsl:gamecfg" hud fps
@@ -36,6 +38,8 @@ static HUD_WANTED: AtomicBool = AtomicBool::new(false); // player choice: show t
 static SAVED_HUD: AtomicI32 = AtomicI32::new(-1);
 static LAST_HUD_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_HUD: std::sync::Mutex<[i32; 11]> = std::sync::Mutex::new([i32::MIN; 11]);
+static LAST_POS_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_POS: std::sync::Mutex<[i32; 3]> = std::sync::Mutex::new([i32::MIN; 3]);
 
 // watchdog + quit
 static WD_OPEN: AtomicBool = AtomicBool::new(false); // page silent: SA-MP chat / HUD shown again
@@ -56,6 +60,10 @@ const MENU_MANAGER: usize = 0xBA6748;
 const MENU_HUD_ON: usize = 0x21; // bool m_bHudOn (HUD + radar)
 const MENU_ACTIVATE_NEXT: usize = 0x33; // bool m_bActivateMenuNextFrame
 const MENU_FRAME_LIMITER: usize = 0x4C; // bool m_bFrameLimiterOn
+const MENU_ACTIVE: usize = 0x5C; // bool m_bMenuActive
+const MENU_PAGE: usize = 0x15D; // u8 m_nCurrentMenuPage
+const MENU_PAGE_MAP: u8 = 5; // eMenuPage MENUPAGE_MAP
+const MENU_PAGE_PAUSE: u8 = 42; // eMenuPage MENUPAGE_PAUSE_MENU
 const PLAYER_PED: usize = 0xB6F5F0; // CPed* of the local player
 const PLAYER_MONEY: usize = 0xB7CE50; // int
 const CLOCK_HOURS: usize = 0xB70153; // u8
@@ -138,6 +146,10 @@ fn restore_hud() {
 
     if let Ok(mut last) = LAST_HUD.lock() {
         *last = [i32::MIN; 11];
+    }
+
+    if let Ok(mut last) = LAST_POS.lock() {
+        *last = [i32::MIN; 3];
     }
 }
 
@@ -386,6 +398,14 @@ pub fn frame() -> Option<List> {
         return None;
     }
 
+    // the GTA pause menu stays (graphics, sound, keys) but its map page is not: back to the pause page
+    unsafe {
+        if menu_byte(MENU_ACTIVE).read() != 0 && menu_byte(MENU_PAGE).read() == MENU_PAGE_MAP {
+            menu_byte(MENU_PAGE).write(MENU_PAGE_PAUSE);
+            tracing::info!("VSL: GTA map page closed");
+        }
+    }
+
     unsafe {
         let hud = menu_byte(MENU_HUD_ON);
         let want = if HUD_WANTED.load(Ordering::Relaxed) { 1u8 } else { 0u8 };
@@ -470,12 +490,60 @@ pub fn frame() -> Option<List> {
     }
 }
 
+/// own position (metres) + camera heading (degrees, 0 = north, clockwise) for the VSL map, compass and GPS:
+/// ~7 times per second, only when it moved >= 1 m or turned >= 2 degrees. Data of the player himself only
+/// (the server decides what the page may show: map / GPS / compass items).
+pub fn pos_frame(position: client_api::gta::matrix::CVector, camera: &client_api::gta::matrix::RwMatrix) -> Option<List> {
+    if !is_ui_locked() {
+        return None;
+    }
+
+    let now = now_ms();
+
+    if now.saturating_sub(LAST_POS_MS.load(Ordering::Relaxed)) < 150 {
+        return None;
+    }
+
+    LAST_POS_MS.store(now, Ordering::Relaxed);
+
+    // the camera looks along its "at" vector (same convention as the 3D audio listener)
+    let mut heading = camera.at.x.atan2(camera.at.y).to_degrees();
+
+    if heading < 0.0 {
+        heading += 360.0;
+    }
+
+    let values = [position.x.round() as i32, position.y.round() as i32, heading.round() as i32 % 360];
+
+    if let Ok(mut last) = LAST_POS.lock() {
+        let same = last[0] != i32::MIN
+            && values[0] == last[0]
+            && values[1] == last[1]
+            && (values[2] - last[2]).rem_euclid(360).min((last[2] - values[2]).rem_euclid(360)) < 2;
+
+        if same {
+            return None;
+        }
+
+        *last = values;
+    }
+
+    let list = List::new();
+
+    for (i, v) in values.iter().enumerate() {
+        list.set_integer(i, *v);
+    }
+
+    Some(list)
+}
+
 /// keys that open VSL pages instead of SA-MP / GTA screens
 pub enum VslKey {
     Chat,
     Esc,
     Tab,
     Help,
+    Map,
 }
 
 pub fn key_for(wparam: usize) -> Option<VslKey> {
@@ -484,6 +552,7 @@ pub fn key_for(wparam: usize) -> Option<VslKey> {
         0x1B if is_ui_locked() && !esc_pass() => Some(VslKey::Esc), // ESC
         0x09 if is_ui_locked() => Some(VslKey::Tab),       // TAB
         0x70 if is_ui_locked() => Some(VslKey::Help),      // F1
+        0x4D if is_ui_locked() => Some(VslKey::Map),       // M
         _ => None,
     }
 }
@@ -510,7 +579,7 @@ pub fn log_key(wparam: usize, input_blocked: bool, routed: bool) {
     use client_api::gta::menu_manager::CMenuManager;
     use client_api::samp::inputs::{Dialog, Input};
 
-    if !matches!(wparam, 0x54 | 0x75 | 0x1B | 0x09 | 0x70) {
+    if !matches!(wparam, 0x54 | 0x75 | 0x1B | 0x09 | 0x70 | 0x4D) {
         return;
     }
 
@@ -533,6 +602,7 @@ pub fn event_name(key: &VslKey) -> &'static str {
         VslKey::Esc => "vsl:esc",
         VslKey::Tab => "vsl:tab",
         VslKey::Help => "vsl:f1",
+        VslKey::Map => "vsl:mapkey",
     }
 }
 

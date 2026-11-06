@@ -354,6 +354,13 @@ pub fn mainloop() {
             manager.trigger_event("vsl:hud", hud);
         }
 
+        if let Some(local) = local_player() {
+            if let Some(pos) = crate::vsl::pos_frame(local.position(), &CCamera::get().matrix()) {
+                let manager = app.manager.lock();
+                manager.trigger_event("vsl:pos", pos);
+            }
+        }
+
         {
             let menu = CMenuManager::get();
             let paused = menu.is_active() || !app.window_focused;

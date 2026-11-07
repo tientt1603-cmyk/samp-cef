@@ -604,6 +604,20 @@ impl Manager {
             });
     }
 
+    /// VSL: every page loads again (the watchdog found the page silent)
+    pub fn reload_all(&self) {
+        for client in self.clients.values() {
+            if let Some(browser) = client.browser() {
+                browser.reload();
+            }
+        }
+    }
+
+    /// VSL: a page is open (on a disconnect it stays, showing "connection lost")
+    pub fn has_browsers(&self) -> bool {
+        !self.clients.is_empty()
+    }
+
     pub fn load_url(&self, browser_id: u32, url: &str) {
         if let Some(client) = self.clients.get(&browser_id) {
             client.load_url(url)

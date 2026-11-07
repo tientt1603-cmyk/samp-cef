@@ -2,7 +2,10 @@
 //! server the plugin hides what SA-MP / GTA draw by themselves and hands the keys to the pages.
 //!
 //! Events from the server (browser events the plugin also reads):
-//!  * "vsl:chatlock" 1/0  - old SA-MP chat window kept off (mode 0); T / F6 -> "vsl:chatkey"
+//!  * "vsl:chatlock" 1/0  - the old SA-MP chat is gone (Owner 2026-11-07 "100% CEF"): no window, its input never
+//!                          opens, it receives no line (CChat::AddEntry dropped); T -> "vsl:chatkey" (T only);
+//!                          F5 / F6 / F7 / F9 do nothing. Before the CEF connection the chat is pre-locked (no
+//!                          "Connecting / Connected" lines); a server without CEF gets it back after 15 s.
 //!  * "vsl:uilock"   1/0  - GTA HUD + radar off (unless the player turned it back on), ESC -> "vsl:esc",
 //!                          TAB -> "vsl:tab", F1 -> "vsl:f1", M -> "vsl:mapkey", live HUD values -> "vsl:hud",
 //!                          own position + camera heading -> "vsl:pos"; the map page of the GTA pause menu
@@ -15,12 +18,11 @@
 //! Events from the page (read before they go to the server):
 //!  * "vsl:beat"           - the page is alive (every 2 s, never sent to the server). Watchdog: while
 //!                           the chat is locked and the page stays silent (8 s; 30 s for the first page
-//!                           load) the old SA-MP chat and GTA HUD come back until the page beats again.
+//!                           load) the page is LOADED AGAIN (no old SA-MP chat any more).
+//! A lost connection keeps the page and sends it "vsl:lost" (it shows "connection lost" + quit).
 //!  * "vsl:ui" "quit"      - sent on to the server (it saves + closes the session), then the game exits
-//!  * "vsl:say" ch hex     - a SA-MP client command typed in the VSL chat (/q, /quit, /fpslimit,
-//!                           /headmove, /dl, /timestamp ...) runs in the game like in the old chat
-//! Any connection reset unlocks everything and restores the player's own settings (the old chat then
-//! shows SA-MP's own "server closed the connection" / ban lines): other servers are never touched.
+//!  * SA-MP client commands (/q, /fpslimit, /dl, /rcon ...) are gone: every chat line goes to the server
+//! A connection reset without a VSL page unlocks everything (other servers are never touched).
 //! Leaving with the VSL quit never unlocks (no flash of the old chat while the game closes).
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +31,24 @@ use cef::types::list::List;
 use client_api::samp::version::{version, Version};
 
 static LOCKED: AtomicBool = AtomicBool::new(false);
+static PRE_LOCK: AtomicBool = AtomicBool::new(false); // until the CEF connection answers (or 15 s)
+static PRE_LOCK_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+static LOST: AtomicBool = AtomicBool::new(false); // connection lost, the page stays ("vsl:lost")
+static RELOAD_REQUEST: AtomicBool = AtomicBool::new(false);
+static DROPPED_LINES: AtomicU64 = AtomicU64::new(0);
+const PRE_LOCK_MS: u64 = 15000;
+
+/// lines SA-MP wanted to print while pre-locked: given back if the server turns out not to be VSL
+struct HeldLine {
+    chat: usize,
+    kind: i32,
+    text: std::ffi::CString,
+    prefix: Option<std::ffi::CString>,
+    colour: u32,
+    prefix_colour: u32,
+}
+
+static HELD: std::sync::Mutex<Vec<HeldLine>> = std::sync::Mutex::new(Vec::new());
 static SAVED_MODE: AtomicI32 = AtomicI32::new(-1);
 static SWALLOW_CHAR: AtomicBool = AtomicBool::new(false);
 
@@ -43,7 +63,6 @@ static LAST_INPUT_CLOSE_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_POS: std::sync::Mutex<[i32; 3]> = std::sync::Mutex::new([i32::MIN; 3]);
 
 // watchdog + quit
-static WD_OPEN: AtomicBool = AtomicBool::new(false); // page silent: SA-MP chat / HUD shown again
 static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0); // 0 = the page has not beaten yet
 static LOCK_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
@@ -118,22 +137,29 @@ fn restore_chat() {
 pub fn set_locked(lock: bool) {
     let was = LOCKED.swap(lock, Ordering::SeqCst);
 
+    if lock {
+        PRE_LOCK.store(false, Ordering::Relaxed);
+
+        if let Ok(mut held) = HELD.lock() {
+            held.clear();   // a VSL server: the connect lines are never shown
+        }
+    }
+
     if lock && !was {
         LOCK_SINCE_MS.store(now_ms(), Ordering::Relaxed);
     }
 
     if was && !lock {
         restore_chat();
-        WD_OPEN.store(false, Ordering::Relaxed);
         LAST_BEAT_MS.store(0, Ordering::Relaxed);
     }
 
     tracing::info!(locked = lock, "VSL chat lock");
 }
 
-/// locked by the server and the page is alive
+/// the old SA-MP chat is locked: by the server, or pre-locked until the CEF connection answers
 pub fn is_locked() -> bool {
-    LOCKED.load(Ordering::Relaxed) && !WD_OPEN.load(Ordering::Relaxed)
+    LOCKED.load(Ordering::Relaxed) || PRE_LOCK.load(Ordering::Relaxed)
 }
 
 // ------------------------------------------------------------------ UI lock
@@ -165,7 +191,7 @@ pub fn set_ui_locked(lock: bool) {
 }
 
 pub fn is_ui_locked() -> bool {
-    UI_LOCK.load(Ordering::Relaxed) && !WD_OPEN.load(Ordering::Relaxed)
+    UI_LOCK.load(Ordering::Relaxed)
 }
 
 // ------------------------------------------------------------------ watchdog
@@ -187,7 +213,6 @@ fn watchdog(now: u64) {
     }
 
     if !LOCKED.load(Ordering::Relaxed) {
-        WD_OPEN.store(false, Ordering::Relaxed);
         return;
     }
 
@@ -197,15 +222,74 @@ fn watchdog(now: u64) {
     } else {
         now.saturating_sub(beat) > BEAT_TIMEOUT_MS
     };
-    let was = WD_OPEN.swap(dead, Ordering::Relaxed);
-
-    if dead && !was {
-        restore_chat();
-        restore_hud();
-        tracing::warn!("VSL page is silent: SA-MP chat and GTA HUD shown again");
-    } else if !dead && was {
-        tracing::info!("VSL page is back: locks active again");
+    if dead {
+        // the page is loaded again and gets the first-load window once more (no old SA-MP chat)
+        RELOAD_REQUEST.store(true, Ordering::Relaxed);
+        LAST_BEAT_MS.store(0, Ordering::Relaxed);
+        LOCK_SINCE_MS.store(now, Ordering::Relaxed);
+        tracing::warn!("VSL page is silent: loading it again");
     }
+}
+
+/// app: the page must be loaded again (watchdog)
+pub fn take_reload() -> bool {
+    RELOAD_REQUEST.swap(false, Ordering::Relaxed)
+}
+
+// ------------------------------------------------------------------ pre-lock, connection lost
+/// SA-MP starts joining a server: the old chat stays hidden until the CEF connection answers
+pub fn pre_lock_start() {
+    PRE_LOCK_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+    PRE_LOCK.store(true, Ordering::Relaxed);
+}
+
+/// no CEF connection after 15 s: not a VSL server, the player's chat comes back with its lines
+fn pre_lock_check(now: u64) {
+    if !PRE_LOCK.load(Ordering::Relaxed) || LOCKED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    if now.saturating_sub(PRE_LOCK_SINCE_MS.load(Ordering::Relaxed)) < PRE_LOCK_MS {
+        return;
+    }
+
+    PRE_LOCK.store(false, Ordering::Relaxed);
+    restore_chat();
+
+    let held: Vec<HeldLine> = HELD.lock().map(|mut h| std::mem::take(&mut *h)).unwrap_or_default();
+
+    unsafe {
+        if let Some(hook) = (*std::ptr::addr_of!(ADD_ENTRY_HOOK)).as_ref() {
+            for line in &held {
+                hook.call(
+                    line.chat as *mut std::ffi::c_void,
+                    line.kind,
+                    line.text.as_ptr(),
+                    line.prefix.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
+                    line.colour,
+                    line.prefix_colour,
+                );
+            }
+        }
+    }
+
+    tracing::info!(lines = held.len(), "VSL: no CEF server answered: SA-MP chat given back");
+}
+
+/// the CEF connection dropped: true = keep the page (it shows "connection lost"), locks stay
+pub fn on_disconnect(has_page: bool) -> bool {
+    if LOCKED.load(Ordering::Relaxed) && has_page {
+        LOST.store(true, Ordering::Relaxed);
+        tracing::info!("VSL: connection lost, the page stays");
+        return true;
+    }
+
+    false
+}
+
+/// a new CEF connection: the page kept from a lost one must go first
+pub fn take_lost() -> bool {
+    LOST.swap(false, Ordering::Relaxed)
 }
 
 // ------------------------------------------------------------------ quit
@@ -252,113 +336,6 @@ pub fn open_native_menu() {
     unsafe { menu_byte(MENU_ACTIVATE_NEXT).write(1) };
 }
 
-/// SA-MP client command (the table SA-MP's own chat uses); true = found and run
-pub fn run_client_command(name: &str, args: &str) -> bool {
-    use client_api::samp::inputs::Input;
-
-    if name.is_empty() || name.len() > 32 {
-        return false;
-    }
-
-    if let Some(input) = Input::get() {
-        unsafe {
-            let count = std::ptr::addr_of!(input.m_nCommandCount).read_unaligned().max(0) as usize;
-            let names = std::ptr::addr_of!(input.m_szCommandName).read_unaligned();
-            let procs = std::ptr::addr_of!(input.m_pCommandProc).read_unaligned();
-
-            for i in 0..count.min(procs.len()) {
-                let raw = &names[i];
-                let len = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-                let cmd: Vec<u8> = raw[..len].iter().map(|&c| c as u8).collect();
-
-                if cmd.eq_ignore_ascii_case(name.as_bytes()) {
-                    if let Some(proc_) = procs[i] {
-                        // SA-MP passes the text after the command (ANSI, max 128)
-                        let mut bytes: Vec<u8> = args
-                            .bytes()
-                            .filter(|&b| b >= 0x20 && b < 0x7F)
-                            .take(128)
-                            .collect();
-                        bytes.push(0);
-                        proc_(bytes.as_ptr() as *const std::os::raw::c_char);
-                        return true;
-                    }
-
-                    return false;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// what to do with a line from the VSL chat ("vsl:say" "<channel> <hex text>")
-pub enum SayAction {
-    Forward,
-    Handled,
-    Quit,
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    let t = text.as_bytes();
-
-    if t.len() % 2 != 0 {
-        return None;
-    }
-
-    let val = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    };
-
-    let mut out = Vec::with_capacity(t.len() / 2);
-
-    for pair in t.chunks(2) {
-        out.push((val(pair[0])? << 4) | val(pair[1])?);
-    }
-
-    Some(out)
-}
-
-pub fn client_say(arguments: &str) -> SayAction {
-    let mut parts = arguments.splitn(2, ' ');
-    let _channel = parts.next();
-    let hex = parts.next().unwrap_or("").trim();
-
-    let bytes = match unhex(hex) {
-        Some(b) => b,
-        None => return SayAction::Forward,
-    };
-
-    let text = String::from_utf8_lossy(&bytes);
-    let text = text.trim();
-
-    if !text.starts_with('/') {
-        return SayAction::Forward;
-    }
-
-    let body = &text[1..];
-    let (name, args) = match body.find(' ') {
-        Some(at) => (&body[..at], body[at + 1..].trim()),
-        None => (body, ""),
-    };
-
-    if name.eq_ignore_ascii_case("q") || name.eq_ignore_ascii_case("quit") {
-        return SayAction::Quit;
-    }
-
-    if run_client_command(name, args) {
-        SayAction::Handled
-    } else {
-        SayAction::Forward
-    }
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -377,6 +354,7 @@ pub fn frame() -> Option<List> {
     }
 
     watchdog(now);
+    pre_lock_check(now);
 
     if is_locked() {
         close_samp_input(now);
@@ -559,11 +537,22 @@ type InputOpenFn = extern "thiscall" fn(*mut std::ffi::c_void);
 
 static mut INPUT_OPEN_HOOK: Option<retour::GenericDetour<InputOpenFn>> = None;
 
+// CChat::AddEntry (rva 0x67650 on 0.3.DL): the one function every old-chat line goes through (player chat,
+// server messages, info / debug lines like "Connected to ..."): locked = dropped, pre-locked = held.
+type AddEntryFn = extern "thiscall" fn(*mut std::ffi::c_void, i32, *const std::os::raw::c_char, *const std::os::raw::c_char, u32, u32);
+
+static mut ADD_ENTRY_HOOK: Option<retour::GenericDetour<AddEntryFn>> = None;
+
+const DL_ADD_ENTRY: usize = 0x67650;
+const DL_ADD_ENTRY_BYTES: [u8; 12] = [0x55, 0x56, 0x8B, 0xE9, 0x57, 0x8D, 0xBD, 0x32, 0x01, 0x00, 0x00, 0x8D];
+
 const DL_INPUT_OPEN: usize = 0x68EC0;
 const DL_INPUT_OPEN_BYTES: [u8; 12] = [0x83, 0xEC, 0x10, 0x56, 0x8B, 0xF1, 0x8B, 0x86, 0xE0, 0x14, 0x00, 0x00];
 
-/// called once from App::initialize_hooks (SA-MP is loaded)
+/// called once from App::initialize_hooks (SA-MP is joining a server)
 pub fn install_hooks() {
+    pre_lock_start();
+
     if version() != Version::V03DL {
         tracing::info!("VSL: no SA-MP input hook for this SA-MP version (state closer only)");
         return;
@@ -584,6 +573,24 @@ pub fn install_hooks() {
             return;
         }
 
+        let entry = base.add(DL_ADD_ENTRY);
+
+        if std::slice::from_raw_parts(entry as *const u8, DL_ADD_ENTRY_BYTES.len()) == DL_ADD_ENTRY_BYTES {
+            let add: AddEntryFn = std::mem::transmute(entry);
+
+            match retour::GenericDetour::new(add, add_entry) {
+                Ok(hook) => {
+                    if hook.enable().is_ok() {
+                        *std::ptr::addr_of_mut!(ADD_ENTRY_HOOK) = Some(hook);
+                        tracing::info!("VSL: SA-MP chat line hook installed");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "VSL: SA-MP chat line hook failed"),
+            }
+        } else {
+            tracing::warn!("VSL: samp.dll is not the expected 0.3.DL build: chat line hook skipped");
+        }
+
         let open: InputOpenFn = std::mem::transmute(addr);
 
         match retour::GenericDetour::new(open, input_open) {
@@ -594,6 +601,42 @@ pub fn install_hooks() {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "VSL: SA-MP input hook failed"),
+        }
+    }
+}
+
+extern "thiscall" fn add_entry(
+    this: *mut std::ffi::c_void, kind: i32, text: *const std::os::raw::c_char, prefix: *const std::os::raw::c_char,
+    colour: u32, prefix_colour: u32,
+) {
+    if LOCKED.load(Ordering::Relaxed) {
+        let n = DROPPED_LINES.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if n == 1 || n % 50 == 0 {
+            tracing::info!(total = n, "VSL: old SA-MP chat lines dropped");
+        }
+
+        return;
+    }
+
+    if PRE_LOCK.load(Ordering::Relaxed) {
+        if !text.is_null() {
+            let copy = unsafe { std::ffi::CStr::from_ptr(text) }.to_owned();
+            let prefix = if prefix.is_null() { None } else { Some(unsafe { std::ffi::CStr::from_ptr(prefix) }.to_owned()) };
+
+            if let Ok(mut held) = HELD.lock() {
+                if held.len() < 50 {
+                    held.push(HeldLine { chat: this as usize, kind, text: copy, prefix, colour, prefix_colour });
+                }
+            }
+        }
+
+        return;
+    }
+
+    unsafe {
+        if let Some(hook) = (*std::ptr::addr_of!(ADD_ENTRY_HOOK)).as_ref() {
+            hook.call(this, kind, text, prefix, colour, prefix_colour);
         }
     }
 }
@@ -644,7 +687,7 @@ pub enum VslKey {
 
 pub fn key_for(wparam: usize) -> Option<VslKey> {
     match wparam {
-        0x54 | 0x75 if is_locked() => Some(VslKey::Chat), // T, F6
+        0x54 if is_locked() => Some(VslKey::Chat),         // T (only T: Owner 2026-11-07)
         0x1B if is_ui_locked() && !esc_pass() => Some(VslKey::Esc), // ESC
         0x09 if is_ui_locked() => Some(VslKey::Tab),       // TAB
         0x70 if is_ui_locked() => Some(VslKey::Help),      // F1
@@ -662,7 +705,7 @@ pub fn hides_async_key(key: i32) -> bool {
     use client_api::samp::inputs::{Dialog, Input};
 
     let owned = match key {
-        0x54 | 0x75 => is_locked(),                  // T, F6
+        0x54 | 0x74 | 0x75 | 0x76 | 0x78 => is_locked(),   // T, F5 stats, F6 chat, F7 chat mode, F9 death list
         0x09 | 0x70 => is_ui_locked(),               // TAB, F1
         _ => false,
     };
@@ -690,6 +733,11 @@ pub fn log_key(wparam: usize, input_blocked: bool, routed: bool) {
         gta_menu = CMenuManager::is_menu_active(),
         "VSL key"
     );
+}
+
+/// SA-MP's own screens on keys while the chat is locked: F5 net stats, F6 chat, F7 chat mode, F9 death list
+pub fn swallowed_key(wparam: usize) -> bool {
+    matches!(wparam, 0x74 | 0x75 | 0x76 | 0x78) && is_locked()
 }
 
 pub fn event_name(key: &VslKey) -> &'static str {

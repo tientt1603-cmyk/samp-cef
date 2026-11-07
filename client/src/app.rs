@@ -252,15 +252,21 @@ impl App {
             crate::external::call_disconnect();
         }
 
-        // VSL: give the player his own SA-MP chat / GTA HUD back (shows SA-MP's own kick / ban lines);
-        // not while the game is closing after the VSL quit (no flash of the old chat)
-        if !crate::vsl::is_quitting() {
+        let mut manager = self.manager.lock();
+
+        // VSL: a VSL page stays and shows "connection lost" (the old SA-MP chat never comes back on a VSL
+        // server); without a page (another server) the player's own chat / HUD come back. Nothing while the
+        // game is closing after the VSL quit.
+        if crate::vsl::is_quitting() {
+            manager.close_all_browsers();
+        } else if crate::vsl::on_disconnect(manager.has_browsers()) {
+            manager.trigger_event("vsl:lost", List::new());
+        } else {
             crate::vsl::set_locked(false);
             crate::vsl::set_ui_locked(false);
+            manager.close_all_browsers();
         }
 
-        let mut manager = self.manager.lock();
-        manager.close_all_browsers();
         self.network.take();
         self.connected = false;
     }
@@ -354,6 +360,10 @@ pub fn mainloop() {
         if let Some(hud) = crate::vsl::frame() {
             let manager = app.manager.lock();
             manager.trigger_event("vsl:hud", hud);
+        }
+
+        if crate::vsl::take_reload() {
+            app.manager.lock().reload_all();
         }
 
         if let Some(local) = local_player() {
@@ -476,23 +486,8 @@ pub fn mainloop() {
                             crate::vsl::beat();
                             continue;
                         }
-                        "vsl:say" => match crate::vsl::client_say(&arguments) {
-                            crate::vsl::SayAction::Handled => continue,
-                            crate::vsl::SayAction::Quit => {
-                                crate::vsl::begin_quit();
-
-                                if let Some(network) = app.network.as_mut() {
-                                    network.send(Event::EmitEventOnServer(
-                                        "vsl:ui".to_string(),
-                                        "quit".to_string(),
-                                    ));
-                                }
-
-                                continue;
-                            }
-                            crate::vsl::SayAction::Forward => (),
-                        },
-                        "vsl:ui" if arguments.trim() == "quit" => crate::vsl::begin_quit(),
+                        // the page sends "quit - -" (three words); the game closes even with no server
+                        "vsl:ui" if arguments.split_whitespace().next() == Some("quit") => crate::vsl::begin_quit(),
                         _ => (),
                     }
 
@@ -541,6 +536,10 @@ pub fn mainloop() {
                 Event::NetworkJoined => {
                     // VSL: a CEF server answered -> hide the old SA-MP chat right away (connect lines);
                     // the server unlocks it again if its page cannot load
+                    if crate::vsl::take_lost() {
+                        app.manager.lock().close_all_browsers();   // the page kept from a lost connection
+                    }
+
                     crate::vsl::set_locked(true);
                     app.connected = true;
                     app.bad_version_notified = false;
@@ -695,6 +694,10 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
 
                     if msg == WM_CHAR && crate::vsl::take_swallowed_char() {
                         return true;
+                    }
+
+                    if (msg == WM_KEYDOWN || msg == WM_KEYUP) && crate::vsl::swallowed_key(wparam) {
+                        return true;   // F5 / F6 / F7 / F9: SA-MP screens that no longer exist on VSL
                     }
                 }
 

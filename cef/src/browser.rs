@@ -71,6 +71,13 @@ impl Browser {
         Frame::from_raw(frame)
     }
 
+    /// reload the page (VSL: the watchdog brings a silent page back instead of the old SA-MP chat)
+    pub fn reload(&self) {
+        if let Some(reload) = self.inner.reload {
+            unsafe { reload(self.inner.get_mut()) };
+        }
+    }
+
     pub fn is_loading(&self) -> bool {
         let is_loading = self.inner.is_loading.unwrap();
 

@@ -13,6 +13,8 @@
 //!  * "vsl:escpass"  1/0  - a SA-MP textdraw selection is open: ESC must reach SA-MP (cancel)
 //!  * "vsl:gameset"  key value - "hud" 0/1 (show the GTA HUD), "fps" 0/1 (frame limiter)
 //!  * "vsl:gameget"        - answer "vsl:gamecfg" hud fps
+//!  * "vsl:sprint"   1/0  - the server's stamina (VSL 2026-11-07): 0 = GTA's sprint energy kept empty (the
+//!                          character cannot sprint), 1 = kept full (only the server's stamina decides)
 //!  * "vsl:nativemenu"     - open the GTA pause menu (settings the VSL menu does not have)
 //!  * "vsl:quitgame"       - leave the game now
 //! Events from the page (read before they go to the server):
@@ -53,6 +55,7 @@ static SAVED_MODE: AtomicI32 = AtomicI32::new(-1);
 static SWALLOW_CHAR: AtomicBool = AtomicBool::new(false);
 
 static UI_LOCK: AtomicBool = AtomicBool::new(false);
+static SPRINT: AtomicI32 = AtomicI32::new(-1); // -1 = the server never said: GTA's own sprint stays
 static ESC_PASS: AtomicBool = AtomicBool::new(false);
 static HUD_WANTED: AtomicBool = AtomicBool::new(false); // player choice: show the GTA HUD anyway
 static SAVED_HUD: AtomicI32 = AtomicI32::new(-1);
@@ -86,6 +89,9 @@ const MENU_PAGE_MAP: u8 = 5; // eMenuPage MENUPAGE_MAP
 const MENU_PAGE_PAUSE: u8 = 42; // eMenuPage MENUPAGE_PAUSE_MENU
 const PLAYER_PED: usize = 0xB6F5F0; // CPed* of the local player
 const PLAYER_MONEY: usize = 0xB7CE50; // int
+const SPRINT_ENERGY: usize = 0xB7CDB4; // f32 CPlayerInfo::m_fSprintEnergy of player 0 (CWorld::Players 0xB7CD98 + 0x1C)
+const SPRINT_FULL: f32 = 1000.0;
+const SPRINT_EMPTY: f32 = -150.0; // GTA: tired, no sprint until it climbs back
 const CLOCK_HOURS: usize = 0xB70153; // u8
 const CLOCK_MINUTES: usize = 0xB70152; // u8
 const PED_HEALTH: usize = 0x540; // f32
@@ -185,6 +191,7 @@ pub fn set_ui_locked(lock: bool) {
 
     if was && !lock {
         restore_hud();
+        SPRINT.store(-1, Ordering::Relaxed);
     }
 
     tracing::info!(locked = lock, "VSL UI lock");
@@ -324,6 +331,12 @@ pub fn esc_pass() -> bool {
     ESC_PASS.load(Ordering::Relaxed)
 }
 
+/// "vsl:sprint" 1/0 from the server (stamina)
+pub fn set_sprint(can: i32) {
+    SPRINT.store(if can == 1 { 1 } else { 0 }, Ordering::Relaxed);
+    tracing::info!(can, "VSL sprint");
+}
+
 /// "vsl:gameset" key value
 pub fn game_set(key: &str, value: i32) {
     match key {
@@ -386,6 +399,23 @@ pub fn frame() -> Option<List> {
 
     if !is_ui_locked() {
         return None;
+    }
+
+    // stamina is the server's: GTA's own sprint energy is held full (may sprint) or empty (tired), every frame
+    let sprint = SPRINT.load(Ordering::Relaxed);
+
+    if sprint >= 0 {
+        unsafe {
+            let energy = SPRINT_ENERGY as *mut f32;
+
+            if sprint == 1 {
+                if energy.read() < SPRINT_FULL {
+                    energy.write(SPRINT_FULL);
+                }
+            } else {
+                energy.write(SPRINT_EMPTY);
+            }
+        }
     }
 
     // the GTA pause menu stays (graphics, sound, keys) but its map page is not: back to the pause page

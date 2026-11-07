@@ -489,6 +489,7 @@ pub fn mainloop() {
                         "vsl:uilock" => crate::vsl::set_ui_locked(list.integer(0) == 1),
                         "vsl:escpass" => crate::vsl::set_esc_pass(list.integer(0) == 1),
                         "vsl:keys" => crate::vsl::set_keys(&list.string(0).to_string()),
+                        "vsl:sprint" => crate::vsl::set_sprint(list.integer(0)),
                         "vsl:gameset" => {
                             let key = list.string(0).to_string();
                             crate::vsl::game_set(&key, list.integer(1));

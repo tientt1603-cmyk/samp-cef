@@ -472,6 +472,7 @@ pub fn mainloop() {
                         "vsl:chatlock" => crate::vsl::set_locked(list.integer(0) == 1),
                         "vsl:uilock" => crate::vsl::set_ui_locked(list.integer(0) == 1),
                         "vsl:escpass" => crate::vsl::set_esc_pass(list.integer(0) == 1),
+                        "vsl:keys" => crate::vsl::set_keys(&list.string(0).to_string()),
                         "vsl:gameset" => {
                             let key = list.string(0).to_string();
                             crate::vsl::game_set(&key, list.integer(1));
@@ -660,20 +661,20 @@ fn vsl_route_key(manager: &Manager, msg: UINT, wparam: WPARAM, chars: bool) -> b
         return false;
     }
 
-    if let Some(key) = crate::vsl::key_for(wparam) {
-        if msg == WM_KEYDOWN {
-            crate::vsl::log_key(wparam, false, true);
-            manager.trigger_event(crate::vsl::event_name(&key), List::new());
-
-            if chars {
-                crate::vsl::swallow_next_char();
-            }
-        }
-
-        return true;
+    if !crate::vsl::owns_key(wparam) {
+        return false;
     }
 
-    (msg == WM_KEYDOWN || msg == WM_KEYUP) && crate::vsl::swallowed_key(wparam)
+    if msg == WM_KEYDOWN {
+        crate::vsl::log_key(wparam, false, true);
+        manager.trigger_event("vsl:key", crate::vsl::key_event(wparam));
+
+        if chars {
+            crate::vsl::swallow_next_char();
+        }
+    }
+
+    true
 }
 
 /// WH_KEYBOARD on the game thread: called when the game takes a key message, before any window procedure.
@@ -686,7 +687,7 @@ extern "system" fn vsl_keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 let repeat = !up && (lparam >> 30) & 1 == 1;
                 let msg = if up { WM_KEYUP } else { WM_KEYDOWN };
 
-                if repeat && crate::vsl::key_for(wparam).is_some() && !manager.is_input_blocked() {
+                if repeat && crate::vsl::owns_key(wparam) && !manager.is_input_blocked() {
                     return 1;   // a held VSL key: no repeated events
                 }
 

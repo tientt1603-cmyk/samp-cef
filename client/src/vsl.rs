@@ -3,8 +3,8 @@
 //!
 //! Events from the server (browser events the plugin also reads):
 //!  * "vsl:chatlock" 1/0  - the old SA-MP chat is gone (Owner 2026-11-07 "100% CEF"): no window, its input never
-//!                          opens, it receives no line (CChat::AddEntry dropped); T -> "vsl:chatkey" (T only);
-//!                          F5 / F6 / F7 / F9 do nothing. Before the CEF connection the chat is pre-locked (no
+//!                          opens, it receives no line (CChat::AddEntry dropped).
+//!  * "vsl:keys" "84 27 ..." - the keys the VSL pages own: taken before SA-MP / GTA, sent as "vsl:key <vk>". Before the CEF connection the chat is pre-locked (no
 //!                          "Connecting / Connected" lines); a server without CEF gets it back after 15 s.
 //!  * "vsl:uilock"   1/0  - GTA HUD + radar off (unless the player turned it back on), ESC -> "vsl:esc",
 //!                          TAB -> "vsl:tab", F1 -> "vsl:f1", M -> "vsl:mapkey", live HUD values -> "vsl:hud",
@@ -676,49 +676,59 @@ fn close_samp_input(now: u64) {
     }
 }
 
-/// keys that open VSL pages instead of SA-MP / GTA screens
-pub enum VslKey {
-    Chat,
-    Esc,
-    Tab,
-    Help,
-    Map,
-}
+// ------------------------------------------------------------------ VSL keys (one system for every page key)
+// The server sends the list ("vsl:keys" "84 27 9 ..."): a listed key is taken before SA-MP / GTA see it and
+// reaches the pages as "vsl:key <vk>"; the page decides what it does (T chat, ESC menu, TAB list, M map,
+// later I bag ...). A new page key = one number on the server, no plugin build (Owner 2026-11-07).
+static KEYS: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 
-pub fn key_for(wparam: usize) -> Option<VslKey> {
-    match wparam {
-        0x54 if is_locked() => Some(VslKey::Chat),         // T (only T: Owner 2026-11-07)
-        0x1B if is_ui_locked() && !esc_pass() => Some(VslKey::Esc), // ESC
-        0x09 if is_ui_locked() => Some(VslKey::Tab),       // TAB
-        0x70 if is_ui_locked() => Some(VslKey::Help),      // F1
-        0x4D if is_ui_locked() => Some(VslKey::Map),       // M
-        _ => None,
+/// "vsl:keys" from the server: the virtual-key codes the VSL pages own
+pub fn set_keys(list: &str) {
+    for k in KEYS.iter() {
+        k.store(false, Ordering::Relaxed);
     }
+
+    let mut n = 0;
+
+    for word in list.split_whitespace() {
+        if let Ok(vk) = word.parse::<usize>() {
+            if vk < 256 {
+                KEYS[vk].store(true, Ordering::Relaxed);
+                n += 1;
+            }
+        }
+    }
+
+    tracing::info!(keys = n, "VSL page keys");
 }
 
-/// GetAsyncKeyState hook: SA-MP also POLLS some keys (chat T / F6, scoreboard TAB, help F1) instead of
-/// reading window messages, so swallowing the message alone is not enough (Owner test 2026-11-06: T opened
-/// the old chat input, F1 the SA-MP key list). While the lock that owns a key is on and no SA-MP input,
-/// SA-MP dialog or GTA menu is using the keyboard, SA-MP sees that key as "not pressed".
+/// a key the VSL pages own right now (ESC goes to SA-MP while one of its textdraw selections is open)
+pub fn owns_key(wparam: usize) -> bool {
+    wparam < 256
+        && KEYS[wparam].load(Ordering::Relaxed)
+        && (is_locked() || is_ui_locked())
+        && !(wparam == 0x1B && esc_pass())
+}
+
+/// GetAsyncKeyState hook: SA-MP also POLLS some keys instead of reading window messages, so an owned key
+/// reads "not pressed" for SA-MP while no SA-MP input, SA-MP dialog or GTA menu uses the keyboard.
 pub fn hides_async_key(key: i32) -> bool {
     use client_api::gta::menu_manager::CMenuManager;
     use client_api::samp::inputs::{Dialog, Input};
 
-    let owned = match key {
-        0x54 | 0x74 | 0x75 | 0x76 | 0x78 => is_locked(),   // T, F5 stats, F6 chat, F7 chat mode, F9 death list
-        0x09 | 0x70 => is_ui_locked(),               // TAB, F1
-        _ => false,
-    };
-
-    owned && !Input::is_active() && !Dialog::is_input_focused() && !CMenuManager::is_menu_active()
+    key >= 0
+        && owns_key(key as usize)
+        && !Input::is_active()
+        && !Dialog::is_input_focused()
+        && !CMenuManager::is_menu_active()
 }
 
-/// diagnostics for the key locks (one line per press of a VSL key, info level)
+/// diagnostics: one line per press of an owned key (info level)
 pub fn log_key(wparam: usize, input_blocked: bool, routed: bool) {
     use client_api::gta::menu_manager::CMenuManager;
     use client_api::samp::inputs::{Dialog, Input};
 
-    if !matches!(wparam, 0x54 | 0x75 | 0x1B | 0x09 | 0x70 | 0x4D) {
+    if wparam >= 256 || !KEYS[wparam].load(Ordering::Relaxed) {
         return;
     }
 
@@ -735,19 +745,11 @@ pub fn log_key(wparam: usize, input_blocked: bool, routed: bool) {
     );
 }
 
-/// SA-MP's own screens on keys while the chat is locked: F5 net stats, F6 chat, F7 chat mode, F9 death list
-pub fn swallowed_key(wparam: usize) -> bool {
-    matches!(wparam, 0x74 | 0x75 | 0x76 | 0x78) && is_locked()
-}
-
-pub fn event_name(key: &VslKey) -> &'static str {
-    match key {
-        VslKey::Chat => "vsl:chatkey",
-        VslKey::Esc => "vsl:esc",
-        VslKey::Tab => "vsl:tab",
-        VslKey::Help => "vsl:f1",
-        VslKey::Map => "vsl:mapkey",
-    }
+/// "vsl:key <vk>" for the pages
+pub fn key_event(wparam: usize) -> List {
+    let list = List::new();
+    list.set_integer(0, wparam as i32);
+    list
 }
 
 pub fn swallow_next_char() {

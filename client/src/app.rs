@@ -215,6 +215,8 @@ impl App {
         }
 
         if let Some(mut addr) = NetGame::get().addr() {
+            crate::vsl::pre_lock_count();   // a server is being joined: 15 s for its CEF part to answer
+
             if !self.samp_ready {
                 App::initialize_hooks();
                 self.samp_ready = true;
@@ -251,7 +253,20 @@ impl App {
         }
 
         let mut manager = self.manager.lock();
-        manager.close_all_browsers();
+
+        // VSL: a VSL page stays and shows "connection lost" (the old SA-MP chat never comes back on a VSL
+        // server); without a page (another server) the player's own chat / HUD come back. Nothing while the
+        // game is closing after the VSL quit.
+        if crate::vsl::is_quitting() {
+            manager.close_all_browsers();
+        } else if crate::vsl::on_disconnect(manager.has_browsers()) {
+            manager.trigger_event("vsl:lost", List::new());
+        } else {
+            crate::vsl::set_locked(false);
+            crate::vsl::set_ui_locked(false);
+            manager.close_all_browsers();
+        }
+
         self.network.take();
         self.connected = false;
     }
@@ -330,8 +345,34 @@ fn shitty() {
     }
 }
 
+/// VSL hooks as early as SA-MP is loaded and the game window exists (the connect / beach screen included):
+/// the old SA-MP chat line + input hooks and the keyboard hook that takes the page keys before every window
+/// procedure (SA-MP's own one may sit in front of ours). Owner test 2026-11-07: T on the beach screen opened
+/// the old input because these came only with the first CEF connection attempt.
+fn install_vsl_hooks() {
+    if crate::vsl::hooks_done() || !client_api::samp::is_loaded() {
+        return;
+    }
+
+    let hwnd = client_api::gta::hwnd();
+
+    if hwnd.is_null() {
+        return;
+    }
+
+    crate::vsl::install_hooks();
+
+    unsafe {
+        let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        let hook = SetWindowsHookExA(WH_KEYBOARD, Some(vsl_keyboard_hook), std::ptr::null_mut(), thread);
+        tracing::info!(ok = !hook.is_null(), "VSL keyboard hook");
+    }
+}
+
 // inside GTA thread
 pub fn mainloop() {
+    install_vsl_hooks();
+
     if let Some(app) = App::get() {
         if !app.connected {
             app.connect();
@@ -339,6 +380,23 @@ pub fn mainloop() {
 
         if !app.samp_ready {
             return;
+        }
+
+        // VSL: old SA-MP chat / GTA HUD off while the server locks them; live HUD values to the pages
+        if let Some(hud) = crate::vsl::frame() {
+            let manager = app.manager.lock();
+            manager.trigger_event("vsl:hud", hud);
+        }
+
+        if crate::vsl::take_reload() {
+            app.manager.lock().reload_all();
+        }
+
+        if let Some(local) = local_player() {
+            if let Some(pos) = crate::vsl::pos_frame(local.position(), &CCamera::get().matrix()) {
+                let manager = app.manager.lock();
+                manager.trigger_event("vsl:pos", pos);
+            }
         }
 
         {
@@ -426,11 +484,41 @@ pub fn mainloop() {
                 }
 
                 Event::EmitEvent(event, list) => {
+                    match event.as_str() {
+                        "vsl:chatlock" => crate::vsl::set_locked(list.integer(0) == 1),
+                        "vsl:uilock" => crate::vsl::set_ui_locked(list.integer(0) == 1),
+                        "vsl:escpass" => crate::vsl::set_esc_pass(list.integer(0) == 1),
+                        "vsl:keys" => crate::vsl::set_keys(&list.string(0).to_string()),
+                        "vsl:sprint" => crate::vsl::set_sprint(list.integer(0)),
+                        "vsl:gameset" => {
+                            let key = list.string(0).to_string();
+                            crate::vsl::game_set(&key, list.integer(1));
+                        }
+                        "vsl:gameget" => {
+                            let manager = app.manager.lock();
+                            manager.trigger_event("vsl:gamecfg", crate::vsl::game_cfg());
+                        }
+                        "vsl:nativemenu" => crate::vsl::open_native_menu(),
+                        "vsl:quitgame" => crate::vsl::begin_quit(),
+                        _ => (),
+                    }
+
                     let manager = app.manager.lock();
                     manager.trigger_event(&event, list);
                 }
 
                 Event::EmitEventOnServer(event, arguments) => {
+                    // VSL: page heartbeat (watchdog), quit, SA-MP client commands typed in the VSL chat
+                    match event.as_str() {
+                        "vsl:beat" => {
+                            crate::vsl::beat();
+                            continue;
+                        }
+                        // the page sends "quit - -" (three words); the game closes even with no server
+                        "vsl:ui" if arguments.split_whitespace().next() == Some("quit") => crate::vsl::begin_quit(),
+                        _ => (),
+                    }
+
                     if let Some(network) = app.network.as_mut() {
                         let event = Event::EmitEventOnServer(event, arguments);
                         network.send(event);
@@ -474,6 +562,13 @@ pub fn mainloop() {
                 }
 
                 Event::NetworkJoined => {
+                    // VSL: a CEF server answered -> hide the old SA-MP chat right away (connect lines);
+                    // the server unlocks it again if its page cannot load
+                    if crate::vsl::take_lost() {
+                        app.manager.lock().close_all_browsers();   // the page kept from a lost connection
+                    }
+
+                    crate::vsl::set_locked(true);
                     app.connected = true;
                     app.bad_version_notified = false;
                     app.reset_connect_backoff();
@@ -570,6 +665,59 @@ pub fn mainloop() {
     }
 }
 
+/// VSL keys: true = the key belongs to a VSL page (event sent) or to a SA-MP screen that no longer exists;
+/// the message must not go on. Same gate as before: not while a page, a SA-MP input / dialog or the GTA
+/// menu holds the keyboard. `chars`: a WM_CHAR will follow (window procedure path) and must be swallowed.
+fn vsl_route_key(manager: &Manager, msg: UINT, wparam: WPARAM, chars: bool) -> bool {
+    if !(crate::vsl::is_locked() || crate::vsl::is_ui_locked())
+        || manager.is_input_blocked()
+        || inputs::Input::is_active()
+        || inputs::Dialog::is_input_focused()
+        || CMenuManager::is_menu_active()
+    {
+        return false;
+    }
+
+    if !crate::vsl::owns_key(wparam) {
+        return false;
+    }
+
+    if msg == WM_KEYDOWN {
+        crate::vsl::log_key(wparam, false, true);
+        manager.trigger_event("vsl:key", crate::vsl::key_event(wparam));
+
+        if chars {
+            crate::vsl::swallow_next_char();
+        }
+    }
+
+    true
+}
+
+/// WH_KEYBOARD on the game thread: called when the game takes a key message, before any window procedure.
+/// A discarded key-down is never translated, so no WM_CHAR follows it.
+extern "system" fn vsl_keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    if code >= 0 {
+        if let Some(app) = App::get() {
+            if let Some(manager) = app.manager.try_lock() {
+                let up = (lparam >> 31) & 1 == 1;
+                let repeat = !up && (lparam >> 30) & 1 == 1;
+                let msg = if up { WM_KEYUP } else { WM_KEYDOWN };
+
+                if repeat && crate::vsl::owns_key(wparam) && !manager.is_input_blocked() {
+                    return 1;   // a held VSL key: no repeated events
+                }
+
+                if vsl_route_key(&manager, msg, wparam, false) {
+                    return 1;
+                }
+            }
+        }
+    }
+
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
 // TODO: Save key state. Mouse too?
 fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
     if let Some(app) = App::get() {
@@ -605,6 +753,23 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
             }
 
             WM_KEYDOWN | WM_KEYUP | WM_CHAR | WM_SYSCHAR | WM_SYSKEYDOWN | WM_SYSKEYUP => {
+                // VSL: on a VSL server T / F6 (chat), ESC (menu), TAB (players), F1 (help) open VSL pages
+                if (msg == WM_KEYDOWN || msg == WM_KEYUP) && vsl_route_key(&manager, msg, wparam, true) {
+                    return true;   // normally the keyboard hook already took it
+                }
+
+                if msg == WM_CHAR && crate::vsl::take_swallowed_char() {
+                    return true;
+                }
+
+                if msg == WM_KEYDOWN
+                    && (lparam >> 30) & 1 == 0
+                    && (crate::vsl::is_locked() || crate::vsl::is_ui_locked())
+                    && !(manager.is_input_blocked() && wparam == 0x54)
+                {
+                    crate::vsl::log_key(wparam, manager.is_input_blocked(), false);   // a VSL key the page did not get
+                }
+
                 let is_system_key = msg == WM_SYSCHAR || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP;
 
                 let mut event: cef_key_event_t = unsafe { std::mem::zeroed() };
@@ -708,6 +873,11 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
 extern "stdcall" fn async_key_state(key: i32) -> u16 {
     if let Some(app) = App::get() {
         let result = app.keystate_hook.call(key);
+
+        // VSL: keys the VSL pages own are never seen as pressed by SA-MP's own polling
+        if crate::vsl::hides_async_key(key) {
+            return 0;
+        }
 
         if let Some(manager) = app.manager.try_lock() {
             if manager.is_input_blocked() {

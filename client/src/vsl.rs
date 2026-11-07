@@ -237,10 +237,17 @@ pub fn take_reload() -> bool {
 }
 
 // ------------------------------------------------------------------ pre-lock, connection lost
-/// SA-MP starts joining a server: the old chat stays hidden until the CEF connection answers
-pub fn pre_lock_start() {
-    PRE_LOCK_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+/// SA-MP is loaded: the old chat stays hidden until the CEF connection answers (no time limit yet)
+fn pre_lock_begin() {
+    PRE_LOCK_SINCE_MS.store(0, Ordering::Relaxed);
     PRE_LOCK.store(true, Ordering::Relaxed);
+}
+
+/// the plugin starts connecting to the server's CEF part: from now on 15 s, then a non-VSL server gets its chat
+pub fn pre_lock_count() {
+    if PRE_LOCK.load(Ordering::Relaxed) && PRE_LOCK_SINCE_MS.load(Ordering::Relaxed) == 0 {
+        PRE_LOCK_SINCE_MS.store(now_ms(), Ordering::Relaxed);
+    }
 }
 
 /// no CEF connection after 15 s: not a VSL server, the player's chat comes back with its lines
@@ -249,7 +256,9 @@ fn pre_lock_check(now: u64) {
         return;
     }
 
-    if now.saturating_sub(PRE_LOCK_SINCE_MS.load(Ordering::Relaxed)) < PRE_LOCK_MS {
+    let since = PRE_LOCK_SINCE_MS.load(Ordering::Relaxed);
+
+    if since == 0 || now.saturating_sub(since) < PRE_LOCK_MS {
         return;
     }
 
@@ -547,11 +556,23 @@ const DL_ADD_ENTRY: usize = 0x67650;
 const DL_ADD_ENTRY_BYTES: [u8; 12] = [0x55, 0x56, 0x8B, 0xE9, 0x57, 0x8D, 0xBD, 0x32, 0x01, 0x00, 0x00, 0x8D];
 
 const DL_INPUT_OPEN: usize = 0x68EC0;
+const DL_INPUT_CLOSE: usize = 0x68FC0;   // CInput::Close, the only code writing m_bEnabled = 0
+const DL_INPUT_CLOSE_BYTES: [u8; 12] = [0x56, 0x8B, 0xF1, 0x8B, 0x86, 0xE0, 0x14, 0x00, 0x00, 0x85, 0xC0, 0x74];
 const DL_INPUT_OPEN_BYTES: [u8; 12] = [0x83, 0xEC, 0x10, 0x56, 0x8B, 0xF1, 0x8B, 0x86, 0xE0, 0x14, 0x00, 0x00];
 
-/// called once from App::initialize_hooks (SA-MP is joining a server)
+static HOOKS_DONE: AtomicBool = AtomicBool::new(false);
+
+pub fn hooks_done() -> bool {
+    HOOKS_DONE.load(Ordering::Relaxed)
+}
+
+/// called from the main loop as soon as samp.dll is loaded (before the connect / beach screen), once
 pub fn install_hooks() {
-    pre_lock_start();
+    if HOOKS_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    pre_lock_begin();
 
     if version() != Version::V03DL {
         tracing::info!("VSL: no SA-MP input hook for this SA-MP version (state closer only)");
@@ -665,10 +686,27 @@ fn close_samp_input(now: u64) {
     }
 
     if let Some(input) = Input::get() {
-        input.m_bEnabled = 0;
-    }
+        let mut closed = false;
 
-    show_cursor(false);   // SA-MP: no cursor, player controls back (CGame::ProcessInputEnabling)
+        // SA-MP's own close (0.3.DL): its box, cursor and the player's controls, exactly like Escape in it
+        if version() == Version::V03DL {
+            unsafe {
+                let base = client_api::samp::handle();
+                let addr = base.add(DL_INPUT_CLOSE);
+
+                if !base.is_null() && std::slice::from_raw_parts(addr as *const u8, 12) == DL_INPUT_CLOSE_BYTES {
+                    let close: extern "thiscall" fn(*mut std::ffi::c_void) = std::mem::transmute(addr);
+                    close(input as *mut Input as *mut std::ffi::c_void);
+                    closed = true;
+                }
+            }
+        }
+
+        if !closed {
+            input.m_bEnabled = 0;
+            show_cursor(false);   // other versions: flag off + SA-MP's cursor / controls restore
+        }
+    }
 
     if now.saturating_sub(LAST_INPUT_CLOSE_MS.load(Ordering::Relaxed)) >= 2000 {
         LAST_INPUT_CLOSE_MS.store(now, Ordering::Relaxed);

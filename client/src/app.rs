@@ -185,18 +185,6 @@ impl App {
 
         client_api::wndproc::append_callback(win_event);
 
-        // VSL: the keys the VSL pages own are read by a keyboard hook on the game's thread: it runs before
-        // EVERY window procedure, so SA-MP's own one (which may sit in front of ours, depending on who
-        // subclassed the window last) never sees T / TAB / F1 / ... first (Owner tests 2026-11-07).
-        unsafe {
-            let hwnd = client_api::gta::hwnd();
-            let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
-            let hook = SetWindowsHookExA(WH_KEYBOARD, Some(vsl_keyboard_hook), std::ptr::null_mut(), thread);
-            tracing::info!(ok = !hook.is_null(), "VSL keyboard hook");
-        }
-
-        crate::vsl::install_hooks();   // VSL: the old SA-MP chat input never opens under the chat lock
-
         NetGame::on_destroy(|| {
             tracing::debug!("SA:MP session is shutting down");
             uninitialize();
@@ -227,6 +215,8 @@ impl App {
         }
 
         if let Some(mut addr) = NetGame::get().addr() {
+            crate::vsl::pre_lock_count();   // a server is being joined: 15 s for its CEF part to answer
+
             if !self.samp_ready {
                 App::initialize_hooks();
                 self.samp_ready = true;
@@ -355,8 +345,34 @@ fn shitty() {
     }
 }
 
+/// VSL hooks as early as SA-MP is loaded and the game window exists (the connect / beach screen included):
+/// the old SA-MP chat line + input hooks and the keyboard hook that takes the page keys before every window
+/// procedure (SA-MP's own one may sit in front of ours). Owner test 2026-11-07: T on the beach screen opened
+/// the old input because these came only with the first CEF connection attempt.
+fn install_vsl_hooks() {
+    if crate::vsl::hooks_done() || !client_api::samp::is_loaded() {
+        return;
+    }
+
+    let hwnd = client_api::gta::hwnd();
+
+    if hwnd.is_null() {
+        return;
+    }
+
+    crate::vsl::install_hooks();
+
+    unsafe {
+        let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        let hook = SetWindowsHookExA(WH_KEYBOARD, Some(vsl_keyboard_hook), std::ptr::null_mut(), thread);
+        tracing::info!(ok = !hook.is_null(), "VSL keyboard hook");
+    }
+}
+
 // inside GTA thread
 pub fn mainloop() {
+    install_vsl_hooks();
+
     if let Some(app) = App::get() {
         if !app.connected {
             app.connect();

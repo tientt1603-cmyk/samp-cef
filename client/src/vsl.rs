@@ -836,22 +836,22 @@ pub fn take_swallowed_char() -> bool {
 // A page key can be HELD (~ = the Mắt thứ ba while it is down): every page key that went to the pages as
 // "vsl:key" also sends "vsl:keyup <vk>" when it is let go - and when the game window loses focus with it down
 // (Alt-Tab), so a page never thinks a key is still held.
-static HELD: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+static HELD_KEYS: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
 
 pub fn set_held(wparam: usize) {
     if wparam < 256 {
-        HELD[wparam].store(true, Ordering::Relaxed);
+        HELD_KEYS[wparam].store(true, Ordering::Relaxed);
     }
 }
 
 /// true once per press: the key was down for the pages and is let go now
 pub fn take_held(wparam: usize) -> bool {
-    wparam < 256 && HELD[wparam].swap(false, Ordering::Relaxed)
+    wparam < 256 && HELD_KEYS[wparam].swap(false, Ordering::Relaxed)
 }
 
 /// the window lost focus: every held page key counts as let go
 pub fn release_held(mut send: impl FnMut(usize)) {
-    for (vk, held) in HELD.iter().enumerate() {
+    for (vk, held) in HELD_KEYS.iter().enumerate() {
         if held.swap(false, Ordering::Relaxed) {
             send(vk);
         }

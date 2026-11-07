@@ -415,6 +415,8 @@ pub fn mainloop() {
             // do not redraw default cursor
             if show_cursor {
                 client_api::samp::inputs::show_cursor(true);
+            } else if !menu.is_active() {
+                crate::vsl::pointer_frame();   // VSL Mắt thứ ba: mouse to the page, keyboard to the game
             }
         }
 
@@ -490,6 +492,7 @@ pub fn mainloop() {
                         "vsl:escpass" => crate::vsl::set_esc_pass(list.integer(0) == 1),
                         "vsl:keys" => crate::vsl::set_keys(&list.string(0).to_string()),
                         "vsl:sprint" => crate::vsl::set_sprint(list.integer(0)),
+                        "vsl:pointer" => crate::vsl::set_pointer(list.integer(0)),
                         "vsl:gameset" => {
                             let key = list.string(0).to_string();
                             crate::vsl::game_set(&key, list.integer(1));
@@ -669,6 +672,11 @@ pub fn mainloop() {
 /// the message must not go on. Same gate as before: not while a page, a SA-MP input / dialog or the GTA
 /// menu holds the keyboard. `chars`: a WM_CHAR will follow (window procedure path) and must be swallowed.
 fn vsl_route_key(manager: &Manager, msg: UINT, wparam: WPARAM, chars: bool) -> bool {
+    // a page key that went to the pages is let go: "vsl:keyup" (whatever holds the keyboard now)
+    if msg == WM_KEYUP && crate::vsl::take_held(wparam) {
+        manager.trigger_event("vsl:keyup", crate::vsl::key_event(wparam));
+    }
+
     if !(crate::vsl::is_locked() || crate::vsl::is_ui_locked())
         || manager.is_input_blocked()
         || inputs::Input::is_active()
@@ -684,6 +692,7 @@ fn vsl_route_key(manager: &Manager, msg: UINT, wparam: WPARAM, chars: bool) -> b
 
     if msg == WM_KEYDOWN {
         crate::vsl::log_key(wparam, false, true);
+        crate::vsl::set_held(wparam);
         manager.trigger_event("vsl:key", crate::vsl::key_event(wparam));
 
         if chars {
@@ -846,6 +855,11 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
 
                 crate::external::window_active(active);
                 app.window_focused = active;
+
+                // VSL: Alt-Tab with a page key held (~ = Mắt thứ ba) counts as letting it go
+                if !active {
+                    crate::vsl::release_held(|vk| manager.trigger_event("vsl:keyup", crate::vsl::key_event(vk)));
+                }
                 app.audio
                     .set_paused(!active || CMenuManager::is_menu_active());
                 manager.set_corrupted(!active);
@@ -861,6 +875,17 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
         // allow user to use menu ...
         if manager.is_input_corrupted() {
             return false;
+        }
+
+        // VSL pointer mode (Mắt thứ ba): clicks and the wheel belong to the page, not to SA-MP / GTA
+        if crate::vsl::pointer_mode() > 0
+            && matches!(
+                msg,
+                WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONDBLCLK
+                    | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONDBLCLK | WM_MBUTTONUP | WM_MOUSEWHEEL
+            )
+        {
+            return true;
         }
 
         return manager.is_input_blocked() && !notify_key_down;

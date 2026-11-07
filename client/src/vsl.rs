@@ -15,6 +15,10 @@
 //!  * "vsl:gameget"        - answer "vsl:gamecfg" hud fps
 //!  * "vsl:sprint"   1/0  - the server's stamina (VSL 2026-11-07): 0 = GTA's sprint energy kept empty (the
 //!                          character cannot sprint), 1 = kept full (only the server's stamina decides)
+//!  * "vsl:pointer"  0/1/2 - the Mắt thứ ba (VSL 2026-11-07): the mouse goes to the VSL page (it draws a dot),
+//!                          the keyboard stays with the game (walking), the camera stands still; 1 = SA-MP's
+//!                          cursor shown, 2 = hidden (SA-MP cursor modes 3 / 4), 0 = normal again.
+//!                          Every page key also sends "vsl:keyup <vk>" when let go or when the window loses focus.
 //!  * "vsl:nativemenu"     - open the GTA pause menu (settings the VSL menu does not have)
 //!  * "vsl:quitgame"       - leave the game now
 //! Events from the page (read before they go to the server):
@@ -826,4 +830,90 @@ pub fn swallow_next_char() {
 
 pub fn take_swallowed_char() -> bool {
     SWALLOW_CHAR.swap(false, Ordering::Relaxed)
+}
+
+// ------------------------------------------------------------------ held keys + pointer (Mắt thứ ba, VSL 2026-11-07)
+// A page key can be HELD (~ = the Mắt thứ ba while it is down): every page key that went to the pages as
+// "vsl:key" also sends "vsl:keyup <vk>" when it is let go - and when the game window loses focus with it down
+// (Alt-Tab), so a page never thinks a key is still held.
+static HELD: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+
+pub fn set_held(wparam: usize) {
+    if wparam < 256 {
+        HELD[wparam].store(true, Ordering::Relaxed);
+    }
+}
+
+/// true once per press: the key was down for the pages and is let go now
+pub fn take_held(wparam: usize) -> bool {
+    wparam < 256 && HELD[wparam].swap(false, Ordering::Relaxed)
+}
+
+/// the window lost focus: every held page key counts as let go
+pub fn release_held(mut send: impl FnMut(usize)) {
+    for (vk, held) in HELD.iter().enumerate() {
+        if held.swap(false, Ordering::Relaxed) {
+            send(vk);
+        }
+    }
+}
+
+// "vsl:pointer" 0/1/2 from the server: the mouse belongs to the VSL page (moves + clicks reach it, the page
+// draws its own dot) while the KEYBOARD STAYS WITH THE GAME (the player keeps walking) and the camera stands
+// still. SA-MP cursor modes: 3 = lock the camera only, cursor shown; 4 = lock the camera only, no cursor.
+// 1 = mode 3, 2 = mode 4 (which one feels right is the Owner's in-game test). 0 = back to normal.
+static POINTER: AtomicI32 = AtomicI32::new(0);
+static POINTER_APPLIED: AtomicI32 = AtomicI32::new(0);
+
+pub fn set_pointer(mode: i32) {
+    POINTER.store(mode.clamp(0, 2), Ordering::Relaxed);
+}
+
+pub fn pointer_mode() -> i32 {
+    POINTER.load(Ordering::Relaxed)
+}
+
+/// every frame on the game thread, only while no page holds the focus (page focus = cursor mode 2, as before)
+pub fn pointer_frame() {
+    let want = POINTER.load(Ordering::Relaxed);
+
+    if want == POINTER_APPLIED.load(Ordering::Relaxed) && want == 0 {
+        return;
+    }
+
+    if want == 0 {
+        POINTER_APPLIED.store(0, Ordering::Relaxed);
+        client_api::samp::inputs::show_cursor(false);   // SA-MP's cursor off + the player's controls back
+        return;
+    }
+
+    set_samp_cursor_mode(if want == 2 { 4 } else { 3 });
+    POINTER_APPLIED.store(want, Ordering::Relaxed);
+}
+
+/// SA-MP CGame::SetCursorMode (0.3.DL; other versions keep the plain cursor of show_cursor)
+fn set_samp_cursor_mode(mode: i32) {
+    use client_api::samp::inputs::Input;
+
+    if Input::is_active() || version() != Version::V03DL {
+        return;
+    }
+
+    unsafe {
+        let base = client_api::samp::handle();
+
+        if base.is_null() {
+            return;
+        }
+
+        let cgame = (base.add(client_api::samp::v03dl::CGAME) as *mut *mut std::ffi::c_void).read();
+
+        if cgame.is_null() {
+            return;
+        }
+
+        let set_cursor_mode: extern "thiscall" fn(*mut std::ffi::c_void, i32, i32) =
+            std::mem::transmute(base.add(client_api::samp::v03dl::CGAME_SETCURSORMODE));
+        set_cursor_mode(cgame, mode, 0);
+    }
 }

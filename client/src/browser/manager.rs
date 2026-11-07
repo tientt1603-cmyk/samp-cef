@@ -3,6 +3,7 @@ use crate::audio::{Audio, BrowserAudioSettings};
 use crate::browser::client::WebClient;
 use crate::external::{BrowserReadyCallback, CallbackList};
 
+use cef::browser::BrowserHost;
 use cef::handlers::render::PaintElement;
 use cef::types::list::List;
 use cef::types::string::CefString;
@@ -368,15 +369,31 @@ impl Manager {
         }
     }
 
+    /// VSL: where the mouse goes - the focused page; else, in the VSL pointer mode (Mắt thứ ba, "vsl:pointer"),
+    /// the page that always listens (the VSL interface) while the keyboard stays with the game.
+    fn mouse_host(&self) -> Option<BrowserHost> {
+        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id)) {
+            return client.browser().map(|browser| browser.host());
+        }
+
+        if crate::vsl::pointer_mode() > 0 {
+            return self
+                .clients
+                .values()
+                .find(|client| client.always_listen_keys())
+                .and_then(|client| client.browser().map(|browser| browser.host()));
+        }
+
+        None
+    }
+
     #[inline]
     pub fn send_mouse_move_event(&mut self, x: i32, y: i32) {
         if self.input_corrupted {
             return;
         }
 
-        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id))
-            && let Some(host) = client.browser().map(|browser| browser.host())
-        {
+        if let Some(host) = self.mouse_host() {
             self.mouse.x = x;
             self.mouse.y = y;
 
@@ -406,9 +423,7 @@ impl Manager {
             return;
         }
 
-        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id))
-            && let Some(host) = client.browser().map(|browser| browser.host())
-        {
+        if let Some(host) = self.mouse_host() {
             self.mouse.keys.insert(button, is_down);
 
             let event = cef_mouse_event_t {
@@ -445,9 +460,7 @@ impl Manager {
             return;
         }
 
-        if let Some(client) = self.focused.as_ref().and_then(|id| self.clients.get(id))
-            && let Some(host) = client.browser().map(|browser| browser.host())
-        {
+        if let Some(host) = self.mouse_host() {
             host.send_mouse_wheel(self.mouse.x, self.mouse.y, delta);
         }
     }
@@ -602,6 +615,20 @@ impl Manager {
             .for_each(|cl| {
                 cl.audio_settings = audio_settings;
             });
+    }
+
+    /// VSL: every page loads again (the watchdog found the page silent)
+    pub fn reload_all(&self) {
+        for client in self.clients.values() {
+            if let Some(browser) = client.browser() {
+                browser.reload();
+            }
+        }
+    }
+
+    /// VSL: a page is open (on a disconnect it stays, showing "connection lost")
+    pub fn has_browsers(&self) -> bool {
+        !self.clients.is_empty()
     }
 
     pub fn load_url(&self, browser_id: u32, url: &str) {

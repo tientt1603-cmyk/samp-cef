@@ -185,6 +185,16 @@ impl App {
 
         client_api::wndproc::append_callback(win_event);
 
+        // VSL: the keys the VSL pages own are read by a keyboard hook on the game's thread: it runs before
+        // EVERY window procedure, so SA-MP's own one (which may sit in front of ours, depending on who
+        // subclassed the window last) never sees T / TAB / F1 / ... first (Owner tests 2026-11-07).
+        unsafe {
+            let hwnd = client_api::gta::hwnd();
+            let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+            let hook = SetWindowsHookExA(WH_KEYBOARD, Some(vsl_keyboard_hook), std::ptr::null_mut(), thread);
+            tracing::info!(ok = !hook.is_null(), "VSL keyboard hook");
+        }
+
         crate::vsl::install_hooks();   // VSL: the old SA-MP chat input never opens under the chat lock
 
         NetGame::on_destroy(|| {
@@ -637,6 +647,59 @@ pub fn mainloop() {
     }
 }
 
+/// VSL keys: true = the key belongs to a VSL page (event sent) or to a SA-MP screen that no longer exists;
+/// the message must not go on. Same gate as before: not while a page, a SA-MP input / dialog or the GTA
+/// menu holds the keyboard. `chars`: a WM_CHAR will follow (window procedure path) and must be swallowed.
+fn vsl_route_key(manager: &Manager, msg: UINT, wparam: WPARAM, chars: bool) -> bool {
+    if !(crate::vsl::is_locked() || crate::vsl::is_ui_locked())
+        || manager.is_input_blocked()
+        || inputs::Input::is_active()
+        || inputs::Dialog::is_input_focused()
+        || CMenuManager::is_menu_active()
+    {
+        return false;
+    }
+
+    if let Some(key) = crate::vsl::key_for(wparam) {
+        if msg == WM_KEYDOWN {
+            crate::vsl::log_key(wparam, false, true);
+            manager.trigger_event(crate::vsl::event_name(&key), List::new());
+
+            if chars {
+                crate::vsl::swallow_next_char();
+            }
+        }
+
+        return true;
+    }
+
+    (msg == WM_KEYDOWN || msg == WM_KEYUP) && crate::vsl::swallowed_key(wparam)
+}
+
+/// WH_KEYBOARD on the game thread: called when the game takes a key message, before any window procedure.
+/// A discarded key-down is never translated, so no WM_CHAR follows it.
+extern "system" fn vsl_keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    if code >= 0 {
+        if let Some(app) = App::get() {
+            if let Some(manager) = app.manager.try_lock() {
+                let up = (lparam >> 31) & 1 == 1;
+                let repeat = !up && (lparam >> 30) & 1 == 1;
+                let msg = if up { WM_KEYUP } else { WM_KEYDOWN };
+
+                if repeat && crate::vsl::key_for(wparam).is_some() && !manager.is_input_blocked() {
+                    return 1;   // a held VSL key: no repeated events
+                }
+
+                if vsl_route_key(&manager, msg, wparam, false) {
+                    return 1;
+                }
+            }
+        }
+    }
+
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
 // TODO: Save key state. Mouse too?
 fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
     if let Some(app) = App::get() {
@@ -673,32 +736,12 @@ fn win_event(msg: UINT, wparam: WPARAM, lparam: LPARAM) -> bool {
 
             WM_KEYDOWN | WM_KEYUP | WM_CHAR | WM_SYSCHAR | WM_SYSKEYDOWN | WM_SYSKEYUP => {
                 // VSL: on a VSL server T / F6 (chat), ESC (menu), TAB (players), F1 (help) open VSL pages
-                if (crate::vsl::is_locked() || crate::vsl::is_ui_locked())
-                    && !manager.is_input_blocked()
-                    && !inputs::Input::is_active()
-                    && !inputs::Dialog::is_input_focused()
-                    && !CMenuManager::is_menu_active()
-                {
-                    if let Some(key) = crate::vsl::key_for(wparam) {
-                        if msg == WM_KEYDOWN {
-                            crate::vsl::log_key(wparam, false, true);
-                            manager.trigger_event(crate::vsl::event_name(&key), List::new());
-                            crate::vsl::swallow_next_char();
-                            return true;
-                        }
+                if (msg == WM_KEYDOWN || msg == WM_KEYUP) && vsl_route_key(&manager, msg, wparam, true) {
+                    return true;   // normally the keyboard hook already took it
+                }
 
-                        if msg == WM_KEYUP {
-                            return true;
-                        }
-                    }
-
-                    if msg == WM_CHAR && crate::vsl::take_swallowed_char() {
-                        return true;
-                    }
-
-                    if (msg == WM_KEYDOWN || msg == WM_KEYUP) && crate::vsl::swallowed_key(wparam) {
-                        return true;   // F5 / F6 / F7 / F9: SA-MP screens that no longer exist on VSL
-                    }
+                if msg == WM_CHAR && crate::vsl::take_swallowed_char() {
+                    return true;
                 }
 
                 if msg == WM_KEYDOWN
